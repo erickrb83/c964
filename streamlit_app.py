@@ -1,249 +1,503 @@
+import os
+import numpy as np
 import streamlit as st
 import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, r2_score
-import altair as alt
-import time
-import zipfile
+import pickle
+import math
 
-# Page title
-st.set_page_config(page_title='ML Model Building', page_icon='🤖')
-st.title('🤖 ML Model Building')
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-with st.expander('About this app'):
-  st.markdown('**What can this app do?**')
-  st.info('This app allow users to build a machine learning (ML) model in an end-to-end workflow. Particularly, this encompasses data upload, data pre-processing, ML model building and post-model analysis.')
+from sklearn import datasets
+from sklearn.preprocessing import LabelEncoder
+import lightgbm as lgb
 
-  st.markdown('**How to use the app?**')
-  st.warning('To engage with the app, go to the sidebar and 1. Select a data set and 2. Adjust the model parameters by adjusting the various slider widgets. As a result, this would initiate the ML model building process, display the model results as well as allowing users to download the generated models and accompanying data.')
-
-  st.markdown('**Under the hood**')
-  st.markdown('Data sets:')
-  st.code('''- Drug solubility data set
-  ''', language='markdown')
-  
-  st.markdown('Libraries used:')
-  st.code('''- Pandas for data wrangling
-- Scikit-learn for building a machine learning model
-- Altair for chart creation
-- Streamlit for user interface
-  ''', language='markdown')
+# Interactive graphs
+import plotly.express as px
+from plotly import graph_objs as go
+import matplotlib.pyplot as plt
 
 
-# Sidebar for accepting input parameters
-with st.sidebar:
-    # Load data
-    st.header('1.1. Input data')
+################################################################
+# 
+# Helper Functions
+#
+################################################################
+def reduce_mem_usage(df):
+    """ iterate through all the columns of a dataframe and modify the data type
+        to reduce memory usage.        
+    """
+    start_mem = df.memory_usage().sum() / 1024**2
+    print('Memory usage of dataframe is {:.2f} MB'.format(start_mem))
+    
+    for col in df.columns:
+        col_type = df[col].dtype
+        
+        if col_type != object:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)  
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+        else:
+            df[col] = df[col].astype('category')
 
-    st.markdown('**1. Use custom data**')
-    uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file, index_col=False)
-      
-    # Download example data
-    @st.cache_data
-    def convert_df(input_df):
-        return input_df.to_csv(index=False).encode('utf-8')
-    example_csv = pd.read_csv('https://raw.githubusercontent.com/dataprofessor/data/master/delaney_solubility_with_descriptors.csv')
-    csv = convert_df(example_csv)
-    st.download_button(
-        label="Download example CSV",
-        data=csv,
-        file_name='delaney_solubility_with_descriptors.csv',
-        mime='text/csv',
+    end_mem = df.memory_usage().sum() / 1024**2
+    print('Memory usage after optimization is: {:.2f} MB'.format(end_mem))
+    print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
+    return df
+
+
+
+def adf_test(series,title=''):
+    """
+    Pass in a time series and an optional title, returns an ADF report
+    """
+    print(f'Augmented Dickey-Fuller Test: {title}')
+    result = adfuller(series.dropna(),autolag='AIC') # .dropna() handles differenced data
+    
+    labels = ['ADF test statistic','p-value','# lags used','# observations']
+    out = pd.Series(result[0:4],index=labels)
+
+    for key,val in result[4].items():
+        out[f'critical value ({key})']=val
+        
+    print(out.to_string())          # .to_string() removes the line "dtype: float64"
+    
+    if result[1] <= 0.05:
+        print("Strong evidence against the null hypothesis")
+        print("Reject the null hypothesis")
+        print("Data has no unit root and is stationary")
+    else:
+        print("Weak evidence against the null hypothesis")
+        print("Fail to reject the null hypothesis")
+        print("Data has a unit root and is non-stationary")
+        
+
+
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+def train_and_eval_model(model, X_train, y_train, cv = 5):
+    cv_results = cross_validate(model, X_train, y_train, cv = cv, scoring = ('r2', 'neg_root_mean_squared_error'),)
+    print('Model:', model)
+    r2_scores = cv_results['test_r2']
+    print('R2 CV Scores:', r2_scores)
+    print('R2 CV scores mean / stdev:', np.mean(r2_scores), '/', np.std(r2_scores)) 
+    
+    rmse_scores = cv_results['test_neg_root_mean_squared_error']
+    rmse_scores = [-1*score for score in rmse_scores]
+    print('RMSE CV scores:', rmse_scores)
+    print('RMSE CV scores mean / stdev:', np.mean(rmse_scores), '/', np.std(rmse_scores))
+    
+    
+def create_features(dt, lags = [28], wins = [7,28]):
+    lag_cols = [f"lag_{lag}" for lag in lags ]
+    for lag, lag_col in zip(lags, lag_cols):
+        dt[lag_col] = dt[["id","sales"]].groupby("id", observed=False)["sales"].shift(lag).fillna(-1)
+
+    for win in wins :
+        for lag,lag_col in zip(lags, lag_cols):
+            dt[f"rmean_{lag}_{win}"] = dt[["id", lag_col]].groupby("id", observed=False)[lag_col].transform(lambda x : x.rolling(win).mean()).fillna(-1)
+        
+    return dt
+
+################################################################
+# 
+#   IMPORT DATA
+#
+################################################################
+cal = pd.read_csv('calendar.csv')
+cal = reduce_mem_usage(cal)
+prices = pd.read_csv('sell_prices.csv')
+prices = reduce_mem_usage(prices)
+val = pd.read_csv('sales_train_validation.csv')
+val = reduce_mem_usage(val)
+
+cal.sort_values(by = 'date', inplace = True, ascending = True)
+cal = cal.drop(['snap_TX', 'snap_WI'], axis = 1)
+
+prices = prices.drop(['store_id'], axis = 1)
+
+val = val.drop(['store_id', 'state_id'], axis = 1)
+if val.isnull().values.any():
+    val.fillna(0)
+
+################################################################
+# 
+# MAIN PAGE
+#
+################################################################
+def show_page():
+    st.title("Demand Forecasting App")
+    st.write("""
+             #### Demand Forecasting App comparing a traditional forecasting tool, Croston Method, to a machine learning model, LightGBM.
+            """)
+
+    st.sidebar.header('User Filters')
+
+show_page()
+
+@st.cache_data
+def get_df():
+    cal = pd.read_csv('calendar.csv')
+    prices = pd.read_csv('sell_prices.csv')
+    val = pd.read_csv('sales_train_validation.csv')
+
+        # Just in case sort dates from oldest to newest
+    cal.sort_values(by = 'date', inplace = True, ascending = True)
+    cal = cal.drop(['snap_TX', 'snap_WI'], axis = 1)
+    prices = prices.drop(['store_id'], axis = 1)
+    # Only keep relevant columns
+    val = val.drop(['store_id', 'state_id'], axis = 1)
+    # Find any Null Values
+    if val.isnull().values.any():
+        val.fillna(0)
+
+    df = pd.melt(val, id_vars=['id', 'item_id', 'dept_id', 'cat_id'], var_name='d', value_name='sales')
+    df = pd.merge(df, cal, on='d', how='left')
+    df["d"] = df["d"].apply(lambda x: int(x.split("_")[1]))
+    return df
+
+del prices
+df = get_df()
+df = reduce_mem_usage(df)
+
+def get_dataset(name):
+    if name in datasets:
+        data = model.load(name)
+        return data
+    return print('Dataset not found')
+
+################################################################
+# 
+# SIDEBAR
+#
+################################################################
+def user_filters():
+    sorted_categories = sorted(df['cat_id'].unique())
+    category_id = st.sidebar.selectbox(
+        'Category', 
+        list(sorted_categories))
+
+    sorted_departments = sorted(df['dept_id'].unique())
+    sorted_departments = [sorted_departments for sorted_departments in sorted_departments if category_id in sorted_departments]
+    department_id = st.sidebar.selectbox(
+        'Department', 
+        sorted_departments)
+    
+    sorted_items = sorted(df['item_id'].unique())
+    sorted_items = [sorted_items for sorted_items in sorted_items if department_id in sorted_items]
+    item_id =st.sidebar.selectbox(
+        'Item ID', 
+        (sorted_items))
+
+    return item_id
+
+item_id = user_filters()
+
+ok = st.sidebar.button('Forecast')
+if ok: 
+    print(True)
+
+################################################################
+#
+# Feature Engineering
+#
+################################################################
+# Drop unimportant columns
+df = df.drop(['wm_yr_wk', 'weekday'], axis =1)
+
+# Create Lags
+df = create_features(df)
+
+item_id_list = df['item_id'].unique().tolist()
+
+# Create Features
+cat_feat = ['item_id', 'dept_id', 'cat_id', 'wday', 'month', 'year', 'event_name_1', 'event_type_1', 'event_name_2', 'event_type_2']
+for cc in cat_feat:
+    le = LabelEncoder()
+    df[cc] = le.fit_transform(df[cc])
+
+item_id_list = dict(zip(item_id_list, df['item_id'].unique().tolist()))
+
+total_days = df.d.max()
+test_days = 31
+train_days = total_days - test_days
+
+################################################################
+# 
+# SPLIT THE DATA
+#
+################################################################
+# Training Data Sets
+X_train = df[df['d'] < train_days].drop(['id', 'sales', 'date'], axis = 1) 
+y_train = df[df['d'] < train_days]['sales']
+
+# Testing Data Sets
+X_test = df[df['d'].between(train_days, total_days)].drop(['id','sales', 'date'], axis = 1)
+y_test = df[df['d'].between(train_days, total_days)]['sales']
+
+################################################################
+#
+# CROSTON METHOD
+#
+################################################################
+def Croston(ts,extra_periods=0,alpha=0.4):
+    d = np.array(ts) # Transform the input into a numpy array
+    cols = len(d) # Historical period length
+    d = np.append(d,[np.nan]*extra_periods) # Append np.nan into the demand array to cover future periods
+    
+    #level (a), periodicity(p) and forecast (f)
+    a,p,f = np.full((3,cols+extra_periods),np.nan)
+    q = 1 #periods since last demand observation
+    
+    # Initialization
+    first_occurence = np.argmax(d[:cols]>0)
+    a[0] = d[first_occurence]
+    p[0] = 1 + first_occurence
+    f[0] = a[0]/p[0]
+# Create all the t+1 forecasts
+    for t in range(0,cols):        
+        if d[t] > 0:
+            a[t+1] = alpha*d[t] + (1-alpha)*a[t] 
+            p[t+1] = alpha*q + (1-alpha)*p[t]
+            f[t+1] = a[t+1]/p[t+1]
+            q = 1           
+        else:
+            a[t+1] = a[t]
+            p[t+1] = p[t]
+            f[t+1] = f[t]
+            q += 1
+       
+    # Future Forecast 
+    a[cols+1:cols+extra_periods] = a[cols]
+    p[cols+1:cols+extra_periods] = p[cols]
+    f[cols+1:cols+extra_periods] = f[cols]
+                      
+    df = pd.DataFrame.from_dict({"Demand":d,"Forecast":f,"Period":p,"Level":a,"Error":d-f})
+    return df
+
+preds = []
+
+@st.cache_data
+def croston_model(preds):
+    item_list = df.item_id.unique().tolist()
+
+    for item in item_list:
+        data = df.loc[df['item_id'] == item]
+        temp = Croston(data.sales, extra_periods= 1)
+        temp = temp.drop(temp.tail(1).index)
+        temp = round(temp.Forecast, 1)
+        preds.append(temp)
+
+    preds = pd.DataFrame(preds).T
+
+    preds.columns = item_list
+    preds = preds.T
+    return preds
+    
+preds = croston_model(preds)
+del df
+################################################################
+# 
+# Evaluate Croston
+#
+################################################################
+@st.cache_data
+def eval_c(error_df):
+    val.drop(['id', 'dept_id', 'cat_id'], axis = 1, inplace= True)
+    y_true_sum = 0
+    y_pred_sum = 0
+    for i in range(len(val)):
+        y_true = val.loc[i]
+        y_true = y_true.iloc[1:]
+        y_pred = preds.loc[i]
+        error_df.append(rmse(y_true, y_pred))
+        y_true_sum = y_true_sum + y_true.sum()
+        y_pred_sum = y_pred_sum + y_pred.sum()
+    
+
+    numerator = len(val.loc[0]) * len(val)
+
+    top = (((y_true_sum - y_pred_sum) **2)/ len(val))
+
+    croston_rmse_total = math.sqrt(top/numerator)
+    return croston_rmse_total, error_df
+
+error_df = []
+croston_rmse_total, error_df = eval_c(error_df)
+del val
+################################################################
+# 
+# LIGHTGBM MODEL
+#
+################################################################
+@st.cache_data
+def lgbm_model():
+    dtrain = lgb.Dataset(X_train , label = y_train,  free_raw_data=False)
+    dvalid = lgb.Dataset(X_test, label = y_test,   free_raw_data=False)
+
+    params = {
+        "objective" : "poisson",
+        "metric" : "rmse",
+        "learning_rate" : 0.075,
+        "sub_feature" : 0.8,
+        "sub_row" : 0.75,
+        "bagging_freq" : 1,
+        "lambda_l2" : 0.1,
+        'verbosity': 1,        
+        'num_leaves': 128,
+        "min_data_in_leaf": 50,
+    }
+
+    model_lgb = lgb.train(params, dtrain, valid_sets = [dtrain, dvalid])
+    return model_lgb  
+
+model_lgb = lgbm_model()
+del X_train, y_train
+################################################################
+# 
+# Evaluate LGBM
+#
+################################################################
+rmse_lgb_each = []
+
+@st.cache_data
+def evaluate_lgbm():
+    feature_importance = lgb.plot_importance(model_lgb,height = 0.5)
+
+    st.pyplot(feature_importance.figure)
+
+    lgb_preds = model_lgb.predict(X_test, num_iteration=model_lgb.best_iteration)
+
+    y_real = y_test
+
+    y_real = pd.concat([X_test, y_test], axis = 1)
+
+    y_real['y_preds'] = lgb_preds
+
+    y_real['r_value'] = y_real['sales'] - y_real['y_preds']
+
+    overall_rmse_lgb = rmse(y_real['sales'], y_real['y_preds'])
+
+    item_list = y_real.item_id.unique().tolist()
+
+    for item in item_list:
+        data = y_real.loc[y_real['item_id'] == item]
+        rmse_lgb_each.append(rmse(data.sales, data.y_preds))
+
+    return overall_rmse_lgb, rmse_lgb_each, y_real
+
+overall_rmse_lgb, rmse_lgb_each, y_real = evaluate_lgbm()
+
+del X_test, y_test
+################################################################
+# 
+# Compare LGBM to Croston
+#
+################################################################
+@st.cache_data
+def comparison(error_df, rmse_lgb_each):
+
+    error_df.columns = ['Croston']
+    rmse_lgb_each = pd.DataFrame(rmse_lgb_each)
+    rmse_lgb_each.columns = ['lgb']
+    error_df = pd.concat([error_df, rmse_lgb_each], axis = 1)
+
+    N = 3
+    ind = np.arange(N)
+    width = 0.25
+    fig, ax = plt.subplots()
+
+    lgbm_sum = np.round([np.median(error_df['lgb']), np.mean(error_df['lgb']), overall_rmse_lgb], 3)
+    croston_sum = np.round([np.median(error_df['Croston']), np.mean(error_df['Croston']), croston_rmse_total], 3)
+
+    bar1 = plt.bar(ind, lgbm_sum, width, label= 'LightGBM')
+    bar2 = plt.bar(ind + width, croston_sum, width, label = "Croston")
+
+    plt.xticks(ind+width/2,['Median RMSE', 'Mean RMSE', 'RMSE']) 
+    ax.set_ylim([0, 11])
+    plt.bar_label(bar1, label_type='edge', padding=4)
+    plt.bar_label(bar2, label_type='edge', padding=4)
+    ax.legend(handles = [bar1, bar2])
+
+    st.pyplot(fig)
+
+    return croston_rmse_total, overall_rmse_lgb
+    
+error_df = pd.DataFrame(error_df)  
+
+croston_rmse_total, overall_rmse_lgb = comparison(error_df, rmse_lgb_each) 
+
+@st.cache_data
+def plot_data(item_id, preds):
+    item_id_num = item_id_list[item_id]
+    cal['d'] = cal["d"].apply(lambda x: int(x.split("_")[1]))
+    dates = cal['date'].unique().tolist()
+    dates = dict(zip(cal['d'], dates)) 
+    
+    
+    preds = preds.T
+    preds['date'] = dates
+    preds['date'] = preds['date'].shift(-1)
+    preds['date'][1912] = '2106-04-24'
+    preds = preds[-32:]
+    
+    filtered_df = y_real.loc[y_real['item_id'] == item_id_num]
+     
+    selected_df = pd.concat([filtered_df[['sales', 'y_preds']].reset_index(drop=True), preds[[item_id_num, 'date']].reset_index(drop=True)], axis = 1)
+   
+    rmse_lgb = np.round(rmse(selected_df['sales'], selected_df['y_preds']), 3)
+    rmse_cros = np.round(rmse(selected_df['sales'], selected_df[item_id_num]), 3)
+    
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x = selected_df.index,
+            y = selected_df[item_id_num],
+            name = 'Croston'
+        )
     )
+    fig.add_trace(
+        go.Scatter(
+            x = selected_df.index,
+            y = selected_df['y_preds'],
+            name = 'LightGBM'
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x = selected_df.index,
+            y = selected_df['sales'],
+            name = 'Sales'
+        )
+    )
+    fig.update_layout(
+        xaxis = dict(
+        tickmode = 'array',
+        tickvals = selected_df.index,
+        ticktext = selected_df["date"]
+    )
+)
+    fig.layout.update(title_text=f'Demand Model Comparison for {item_id}', xaxis_rangeslider_visible = True)
+    st.plotly_chart(fig)
 
-    # Select example data
-    st.markdown('**1.2. Use example data**')
-    example_data = st.toggle('Load example data')
-    if example_data:
-        df = pd.read_csv('https://raw.githubusercontent.com/dataprofessor/data/master/delaney_solubility_with_descriptors.csv')
-
-    st.header('2. Set Parameters')
-    parameter_split_size = st.slider('Data split ratio (% for Training Set)', 10, 90, 80, 5)
-
-    st.subheader('2.1. Learning Parameters')
-    with st.expander('See parameters'):
-        parameter_n_estimators = st.slider('Number of estimators (n_estimators)', 0, 1000, 100, 100)
-        parameter_max_features = st.select_slider('Max features (max_features)', options=['all', 'sqrt', 'log2'])
-        parameter_min_samples_split = st.slider('Minimum number of samples required to split an internal node (min_samples_split)', 2, 10, 2, 1)
-        parameter_min_samples_leaf = st.slider('Minimum number of samples required to be at a leaf node (min_samples_leaf)', 1, 10, 2, 1)
-
-    st.subheader('2.2. General Parameters')
-    with st.expander('See parameters', expanded=False):
-        parameter_random_state = st.slider('Seed number (random_state)', 0, 1000, 42, 1)
-        parameter_criterion = st.select_slider('Performance measure (criterion)', options=['squared_error', 'absolute_error', 'friedman_mse'])
-        parameter_bootstrap = st.select_slider('Bootstrap samples when building trees (bootstrap)', options=[True, False])
-        parameter_oob_score = st.select_slider('Whether to use out-of-bag samples to estimate the R^2 on unseen data (oob_score)', options=[False, True])
-
-    sleep_time = st.slider('Sleep time', 0, 3, 0)
-
-# Initiate the model building process
-if uploaded_file or example_data: 
-    with st.status("Running ...", expanded=True) as status:
-    
-        st.write("Loading data ...")
-        time.sleep(sleep_time)
-
-        st.write("Preparing data ...")
-        time.sleep(sleep_time)
-        X = df.iloc[:,:-1]
-        y = df.iloc[:,-1]
-            
-        st.write("Splitting data ...")
-        time.sleep(sleep_time)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=(100-parameter_split_size)/100, random_state=parameter_random_state)
-    
-        st.write("Model training ...")
-        time.sleep(sleep_time)
-
-        if parameter_max_features == 'all':
-            parameter_max_features = None
-            parameter_max_features_metric = X.shape[1]
         
-        rf = RandomForestRegressor(
-                n_estimators=parameter_n_estimators,
-                max_features=parameter_max_features,
-                min_samples_split=parameter_min_samples_split,
-                min_samples_leaf=parameter_min_samples_leaf,
-                random_state=parameter_random_state,
-                criterion=parameter_criterion,
-                bootstrap=parameter_bootstrap,
-                oob_score=parameter_oob_score)
-        rf.fit(X_train, y_train)
-        
-        st.write("Applying model to make predictions ...")
-        time.sleep(sleep_time)
-        y_train_pred = rf.predict(X_train)
-        y_test_pred = rf.predict(X_test)
-            
-        st.write("Evaluating performance metrics ...")
-        time.sleep(sleep_time)
-        train_mse = mean_squared_error(y_train, y_train_pred)
-        train_r2 = r2_score(y_train, y_train_pred)
-        test_mse = mean_squared_error(y_test, y_test_pred)
-        test_r2 = r2_score(y_test, y_test_pred)
-        
-        st.write("Displaying performance metrics ...")
-        time.sleep(sleep_time)
-        parameter_criterion_string = ' '.join([x.capitalize() for x in parameter_criterion.split('_')])
-        #if 'Mse' in parameter_criterion_string:
-        #    parameter_criterion_string = parameter_criterion_string.replace('Mse', 'MSE')
-        rf_results = pd.DataFrame(['Random forest', train_mse, train_r2, test_mse, test_r2]).transpose()
-        rf_results.columns = ['Method', f'Training {parameter_criterion_string}', 'Training R2', f'Test {parameter_criterion_string}', 'Test R2']
-        # Convert objects to numerics
-        for col in rf_results.columns:
-            rf_results[col] = pd.to_numeric(rf_results[col], errors='ignore')
-        # Round to 3 digits
-        rf_results = rf_results.round(3)
-        
-    status.update(label="Status", state="complete", expanded=False)
+    st.write(f'LGBM RMSE for {item_id} = {rmse_lgb}')
+    st.write(f'Croston RMSE for {item_id} = {rmse_cros}')
+    del dates
 
-    # Display data info
-    st.header('Input data', divider='rainbow')
-    col = st.columns(4)
-    col[0].metric(label="No. of samples", value=X.shape[0], delta="")
-    col[1].metric(label="No. of X variables", value=X.shape[1], delta="")
-    col[2].metric(label="No. of Training samples", value=X_train.shape[0], delta="")
-    col[3].metric(label="No. of Test samples", value=X_test.shape[0], delta="")
-    
-    with st.expander('Initial dataset', expanded=True):
-        st.dataframe(df, height=210, use_container_width=True)
-    with st.expander('Train split', expanded=False):
-        train_col = st.columns((3,1))
-        with train_col[0]:
-            st.markdown('**X**')
-            st.dataframe(X_train, height=210, hide_index=True, use_container_width=True)
-        with train_col[1]:
-            st.markdown('**y**')
-            st.dataframe(y_train, height=210, hide_index=True, use_container_width=True)
-    with st.expander('Test split', expanded=False):
-        test_col = st.columns((3,1))
-        with test_col[0]:
-            st.markdown('**X**')
-            st.dataframe(X_test, height=210, hide_index=True, use_container_width=True)
-        with test_col[1]:
-            st.markdown('**y**')
-            st.dataframe(y_test, height=210, hide_index=True, use_container_width=True)
+plot_data(item_id, preds)
 
-    # Zip dataset files
-    df.to_csv('dataset.csv', index=False)
-    X_train.to_csv('X_train.csv', index=False)
-    y_train.to_csv('y_train.csv', index=False)
-    X_test.to_csv('X_test.csv', index=False)
-    y_test.to_csv('y_test.csv', index=False)
-    
-    list_files = ['dataset.csv', 'X_train.csv', 'y_train.csv', 'X_test.csv', 'y_test.csv']
-    with zipfile.ZipFile('dataset.zip', 'w') as zipF:
-        for file in list_files:
-            zipF.write(file, compress_type=zipfile.ZIP_DEFLATED)
 
-    with open('dataset.zip', 'rb') as datazip:
-        btn = st.download_button(
-                label='Download ZIP',
-                data=datazip,
-                file_name="dataset.zip",
-                mime="application/octet-stream"
-                )
-    
-    # Display model parameters
-    st.header('Model parameters', divider='rainbow')
-    parameters_col = st.columns(3)
-    parameters_col[0].metric(label="Data split ratio (% for Training Set)", value=parameter_split_size, delta="")
-    parameters_col[1].metric(label="Number of estimators (n_estimators)", value=parameter_n_estimators, delta="")
-    parameters_col[2].metric(label="Max features (max_features)", value=parameter_max_features_metric, delta="")
-    
-    # Display feature importance plot
-    importances = rf.feature_importances_
-    feature_names = list(X.columns)
-    forest_importances = pd.Series(importances, index=feature_names)
-    df_importance = forest_importances.reset_index().rename(columns={'index': 'feature', 0: 'value'})
-    
-    bars = alt.Chart(df_importance).mark_bar(size=40).encode(
-             x='value:Q',
-             y=alt.Y('feature:N', sort='-x')
-           ).properties(height=250)
-
-    performance_col = st.columns((2, 0.2, 3))
-    with performance_col[0]:
-        st.header('Model performance', divider='rainbow')
-        st.dataframe(rf_results.T.reset_index().rename(columns={'index': 'Parameter', 0: 'Value'}))
-    with performance_col[2]:
-        st.header('Feature importance', divider='rainbow')
-        st.altair_chart(bars, theme='streamlit', use_container_width=True)
-
-    # Prediction results
-    st.header('Prediction results', divider='rainbow')
-    s_y_train = pd.Series(y_train, name='actual').reset_index(drop=True)
-    s_y_train_pred = pd.Series(y_train_pred, name='predicted').reset_index(drop=True)
-    df_train = pd.DataFrame(data=[s_y_train, s_y_train_pred], index=None).T
-    df_train['class'] = 'train'
-        
-    s_y_test = pd.Series(y_test, name='actual').reset_index(drop=True)
-    s_y_test_pred = pd.Series(y_test_pred, name='predicted').reset_index(drop=True)
-    df_test = pd.DataFrame(data=[s_y_test, s_y_test_pred], index=None).T
-    df_test['class'] = 'test'
-    
-    df_prediction = pd.concat([df_train, df_test], axis=0)
-    
-    prediction_col = st.columns((2, 0.2, 3))
-    
-    # Display dataframe
-    with prediction_col[0]:
-        st.dataframe(df_prediction, height=320, use_container_width=True)
-
-    # Display scatter plot of actual vs predicted values
-    with prediction_col[2]:
-        scatter = alt.Chart(df_prediction).mark_circle(size=60).encode(
-                        x='actual',
-                        y='predicted',
-                        color='class'
-                  )
-        st.altair_chart(scatter, theme='streamlit', use_container_width=True)
-
-    
-# Ask for CSV upload if none is detected
-else:
-    st.warning('👈 Upload a CSV file or click *"Load example data"* to get started!')
